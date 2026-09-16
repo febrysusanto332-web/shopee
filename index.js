@@ -5,36 +5,45 @@ import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // Config — set these in Render's Environment Variables tab
-// Two Threads accounts are supported. "akun_1" and "akun_2" select between them.
+// Supports ANY number of Threads accounts. Just add more numbered variables:
+// THREADS_ACCESS_TOKEN_1 / THREADS_USER_ID_1, THREADS_ACCESS_TOKEN_2 / THREADS_USER_ID_2,
+// THREADS_ACCESS_TOKEN_3 / THREADS_USER_ID_3, ... no code changes needed.
+// Tools select between them via "akun_1", "akun_2", "akun_3", etc.
 // ---------------------------------------------------------------------------
 const GRAPH_BASE = "https://graph.threads.net/v1.0";
 
-const ACCOUNTS = {
-  akun_1: {
-    label: process.env.THREADS_ACCOUNT_1_LABEL || "Akun 1",
-    accessToken: process.env.THREADS_ACCESS_TOKEN_1,
-    userId: process.env.THREADS_USER_ID_1,
-  },
-  akun_2: {
-    label: process.env.THREADS_ACCOUNT_2_LABEL || "Akun 2",
-    accessToken: process.env.THREADS_ACCESS_TOKEN_2,
-    userId: process.env.THREADS_USER_ID_2,
-  },
-};
+const ACCOUNTS = {};
+for (let i = 1; ; i++) {
+  const token = process.env[`THREADS_ACCESS_TOKEN_${i}`];
+  const userId = process.env[`THREADS_USER_ID_${i}`];
+  if (!token && !userId) break; // stop at the first gap in numbering
+  ACCOUNTS[`akun_${i}`] = {
+    label: process.env[`THREADS_ACCOUNT_${i}_LABEL`] || `Akun ${i}`,
+    accessToken: token,
+    userId: userId,
+  };
+}
+
+const accountKeys = Object.keys(ACCOUNTS);
+
+if (accountKeys.length === 0) {
+  console.warn(
+    "[WARN] No Threads accounts configured. Set THREADS_ACCESS_TOKEN_1 and " +
+      "THREADS_USER_ID_1 (and _2, _3, ... for more accounts) in Render's Environment Variables."
+  );
+}
 
 for (const [key, acc] of Object.entries(ACCOUNTS)) {
   if (!acc.accessToken || !acc.userId) {
-    console.warn(
-      `[WARN] Credentials for ${key} (${acc.label}) are incomplete. ` +
-        `Set THREADS_ACCESS_TOKEN_${key === "akun_1" ? "1" : "2"} and ` +
-        `THREADS_USER_ID_${key === "akun_1" ? "1" : "2"} in Render's Environment Variables.`
-    );
+    console.warn(`[WARN] Credentials for ${key} (${acc.label}) are incomplete.`);
   }
 }
 
 function getAccount(accountKey) {
   const acc = ACCOUNTS[accountKey];
-  if (!acc) throw new Error(`Unknown account "${accountKey}". Use "akun_1" or "akun_2".`);
+  if (!acc) {
+    throw new Error(`Unknown account "${accountKey}". Available: ${accountKeys.join(", ") || "(none configured)"}`);
+  }
   if (!acc.accessToken || !acc.userId) {
     throw new Error(`Account "${accountKey}" (${acc.label}) is not configured with credentials yet.`);
   }
@@ -64,10 +73,13 @@ async function threadsFetch(accessToken, path, { method = "GET", params = {}, bo
   return data;
 }
 
-const accountField = z
-  .enum(["akun_1", "akun_2"])
-  .default("akun_1")
-  .describe("Akun Threads mana yang dipakai: 'akun_1' atau 'akun_2'");
+const accountField = (accountKeys.length > 0 ? z.enum(accountKeys) : z.string())
+  .default(accountKeys[0] || "akun_1")
+  .describe(
+    accountKeys.length > 0
+      ? `Akun Threads mana yang dipakai: ${accountKeys.join(", ")}`
+      : "Akun Threads mana yang dipakai (belum ada akun yang ter-konfigurasi)"
+  );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,6 +88,39 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 function createServer() {
   const server = new McpServer({ name: "threads-mcp", version: "1.0.0" });
+
+  server.registerTool(
+    "search_threads",
+    {
+      title: "Search public Threads posts by keyword",
+      description:
+        "Search for public Threads posts matching a keyword. Returned posts can be replied to directly using reply_to_post afterwards. Note: without the threads_keyword_search permission approved, search is limited to the account's own posts; results are also capped at roughly 20-30 per call by Threads itself.",
+      inputSchema: {
+        account: accountField,
+        query: z.string().min(1).describe("Keyword to search for"),
+        search_type: z
+          .enum(["TOP", "RECENT"])
+          .default("RECENT")
+          .describe("TOP = most relevant/popular, RECENT = newest first"),
+        media_type: z
+          .enum(["TEXT", "IMAGE", "VIDEO"])
+          .optional()
+          .describe("Optional filter by media type"),
+      },
+    },
+    async ({ account, query, search_type, media_type }) => {
+      const { accessToken } = getAccount(account);
+      const data = await threadsFetch(accessToken, "/keyword_search", {
+        params: {
+          q: query,
+          search_type,
+          ...(media_type ? { media_type } : {}),
+          fields: "id,text,media_type,permalink,timestamp,username,has_replies,is_quote_post,is_reply",
+        },
+      });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
 
   server.registerTool(
     "list_accounts",
@@ -130,7 +175,7 @@ function createServer() {
     {
       title: "Post to Threads",
       description:
-        "Create and publish a new post on Threads. Supports plain text, or text with a single image URL.",
+        "Create and publish a new post on Threads. Supports plain text, text with a single image URL, or text with a single video URL. Image/video must be a public, direct URL (e.g. from Imgur) — not a preview/share link.",
       inputSchema: {
         account: accountField,
         text: z.string().min(1).describe("The text content of the post"),
@@ -138,22 +183,49 @@ function createServer() {
           .string()
           .url()
           .optional()
-          .describe("Optional public URL of an image to attach to the post"),
+          .describe("Optional public direct URL of an image to attach to the post"),
+        video_url: z
+          .string()
+          .url()
+          .optional()
+          .describe(
+            "Optional public direct URL of a video to attach to the post (mutually exclusive with image_url). Videos take longer to process."
+          ),
       },
     },
-    async ({ account, text, image_url }) => {
+    async ({ account, text, image_url, video_url }) => {
       const { accessToken, userId, label } = getAccount(account);
+      const mediaType = video_url ? "VIDEO" : image_url ? "IMAGE" : "TEXT";
       const container = await threadsFetch(accessToken, `/${userId}/threads`, {
         method: "POST",
         body: {
-          media_type: image_url ? "IMAGE" : "TEXT",
+          media_type: mediaType,
           text,
+          ...(video_url ? { video_url } : {}),
           ...(image_url ? { image_url } : {}),
         },
       });
 
-      // Threads recommends a short delay before publishing a created container
-      await sleep(2000);
+      // Poll the container status until it's FINISHED instead of a fixed short
+      // delay — videos in particular can take a while to process on Meta's side.
+      const maxAttempts = mediaType === "VIDEO" ? 40 : 10; // ~2min for video, ~30s for image/text
+      let status = "IN_PROGRESS";
+      for (let i = 0; i < maxAttempts; i++) {
+        await sleep(3000);
+        const statusCheck = await threadsFetch(accessToken, `/${container.id}`, {
+          params: { fields: "status,error_message" },
+        });
+        status = statusCheck.status;
+        if (status === "FINISHED") break;
+        if (status === "ERROR") {
+          throw new Error(`Media processing failed: ${statusCheck.error_message || "unknown error"}`);
+        }
+      }
+      if (status !== "FINISHED") {
+        throw new Error(
+          `Media masih diproses setelah menunggu (status: ${status}). Coba cek lagi nanti pakai creation_id: ${container.id}`
+        );
+      }
 
       const published = await threadsFetch(accessToken, `/${userId}/threads_publish`, {
         method: "POST",
@@ -172,18 +244,45 @@ function createServer() {
     "get_my_posts",
     {
       title: "Get my Threads posts",
-      description: "Fetch recent posts from the connected Threads account.",
+      description:
+        "Fetch recent posts from the connected Threads account. Supports pagination — if there are more posts beyond the limit, the response includes a 'next_cursor' you can pass back in as 'after' to get the next page. Call this repeatedly with the returned cursor to walk through ALL posts.",
       inputSchema: {
         account: accountField,
-        limit: z.number().int().min(1).max(50).default(10).describe("Number of posts to fetch"),
+        limit: z.number().int().min(1).max(50).default(25).describe("Number of posts to fetch per page (max 50)"),
+        after: z
+          .string()
+          .optional()
+          .describe("Pagination cursor from a previous call's next_cursor, to fetch the next page"),
       },
     },
-    async ({ account, limit }) => {
+    async ({ account, limit, after }) => {
       const { accessToken, userId } = getAccount(account);
       const data = await threadsFetch(accessToken, `/${userId}/threads`, {
-        params: { fields: "id,text,timestamp,permalink,media_type", limit },
+        params: {
+          fields: "id,text,timestamp,permalink,media_type",
+          limit,
+          ...(after ? { after } : {}),
+        },
       });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+
+      const nextCursor = data.paging?.cursors?.after || null;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                posts: data.data || [],
+                next_cursor: nextCursor,
+                has_more: Boolean(nextCursor),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
   );
 
@@ -324,6 +423,35 @@ function createServer() {
               null,
               2
             ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "hide_reply",
+    {
+      title: "Hide or unhide a reply",
+      description:
+        "Hide (or unhide) a top-level reply on your Threads post. Hidden replies are only visible to you and the person who wrote them — everyone else won't see it. This automatically hides all nested replies under it too. Use this as an alternative to blocking a specific commenter, since Threads API doesn't support blocking users directly.",
+      inputSchema: {
+        account: accountField,
+        reply_id: z.string().min(1).describe("The ID of the reply to hide/unhide"),
+        hide: z.boolean().default(true).describe("true to hide, false to unhide"),
+      },
+    },
+    async ({ account, reply_id, hide }) => {
+      const { accessToken } = getAccount(account);
+      const data = await threadsFetch(accessToken, `/${reply_id}/manage_reply`, {
+        method: "POST",
+        params: { hide },
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Reply ${reply_id} ${hide ? "disembunyikan" : "ditampilkan lagi"}. Response: ${JSON.stringify(data)}`,
           },
         ],
       };
