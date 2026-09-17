@@ -12,6 +12,17 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------
 const GRAPH_BASE = "https://graph.threads.net/v1.0";
 
+// Public Threads search is handled through Apify so it does not depend on
+// Meta's threads_keyword_search permission / App Review. Meta API is still
+// used for your own accounts (posting, insights, replies, etc.).
+const APIFY_API_BASE = "https://api.apify.com/v2";
+const APIFY_TOKEN = process.env.APIFY_TOKEN || "";
+const APIFY_PRIMARY_ACTOR =
+  process.env.APIFY_PRIMARY_ACTOR || "scrapersdelight/threads-keyword-search-scraper";
+const APIFY_FALLBACK_ACTOR =
+  process.env.APIFY_FALLBACK_ACTOR || "logical_scrapers/threads-search-scraper";
+const APIFY_MAX_CHARGE_USD = Number(process.env.APIFY_MAX_CHARGE_USD || "0.50");
+
 const ACCOUNTS = {};
 for (let i = 1; ; i++) {
   const token = process.env[`THREADS_ACCESS_TOKEN_${i}`];
@@ -139,6 +150,231 @@ function mcpToolError(err) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Apify public-search helpers
+// ---------------------------------------------------------------------------
+class ApifyError extends Error {
+  constructor(message, { status, actor, data } = {}) {
+    super(message);
+    this.name = "ApifyError";
+    this.status = status;
+    this.actor = actor;
+    this.data = data;
+  }
+}
+
+function actorRef(actor) {
+  // Apify's REST API accepts owner~actor-name. Environment variables may use
+  // the friendlier owner/actor-name format shown in the Apify Store.
+  return String(actor || "").trim().replace("/", "~");
+}
+
+async function apifyRunActor(actor, input, { billingLimit = 100 } = {}) {
+  if (!APIFY_TOKEN) {
+    throw new ApifyError(
+      "APIFY_TOKEN belum dikonfigurasi di Render. Tambahkan Environment Variable APIFY_TOKEN lalu redeploy.",
+      { actor }
+    );
+  }
+
+  const actorId = actorRef(actor);
+  const url = new URL(`${APIFY_API_BASE}/actors/${actorId}/run-sync-get-dataset-items`);
+  // Cost guardrails. maxItems is a billing cap for pay-per-result Actors.
+  url.searchParams.set("maxItems", String(Math.max(1, Math.min(500, billingLimit))));
+  if (Number.isFinite(APIFY_MAX_CHARGE_USD) && APIFY_MAX_CHARGE_USD > 0) {
+    url.searchParams.set("maxTotalChargeUsd", String(APIFY_MAX_CHARGE_USD));
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 295_000); // Apify sync max is ~300s
+
+  let res;
+  try {
+    res = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${APIFY_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err?.name === "AbortError") {
+      throw new ApifyError(`Apify Actor ${actor} timeout setelah ~295 detik.`, { actor });
+    }
+    throw new ApifyError(`Gagal menghubungi Apify Actor ${actor}: ${err?.message || err}`, { actor });
+  }
+  clearTimeout(timeout);
+
+  const raw = await res.text();
+  let data = null;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { raw };
+    }
+  }
+
+  if (!res.ok) {
+    const msg =
+      data?.error?.message ||
+      data?.message ||
+      data?.raw ||
+      res.statusText ||
+      "Unknown Apify error";
+    throw new ApifyError(`Apify ${res.status} pada ${actor}: ${msg}`, {
+      status: res.status,
+      actor,
+      data,
+    });
+  }
+
+  if (!Array.isArray(data)) {
+    throw new ApifyError(`Actor ${actor} selesai tetapi response dataset bukan array.`, {
+      status: res.status,
+      actor,
+      data,
+    });
+  }
+  return data;
+}
+
+const asNumber = (...values) => {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+};
+
+function normalizeApifyPost(item, provider) {
+  const id = String(item.postId ?? item.id ?? item.pk ?? item.code ?? item.postCode ?? "");
+  const url = item.postUrl ?? item.url ?? item.permalink ?? null;
+  const timestamp = item.postedAt ?? item.createdAt ?? item.timestamp ?? item.takenAt ?? null;
+  const username = item.authorUsername ?? item.username ?? item.author?.username ?? null;
+  const fullName = item.authorFullName ?? item.fullName ?? item.author?.fullName ?? null;
+  const likeCount = asNumber(item.likeCount, item.likes, item.like_count);
+  const replyCount = asNumber(item.replyCount, item.replies, item.reply_count);
+  const repostCount = asNumber(item.repostCount, item.reposts, item.repost_count);
+  const quoteCount = asNumber(item.quoteCount, item.quotes, item.quote_count);
+  const reshareCount = asNumber(item.reshareCount, item.reshares, item.reshare_count);
+  const engagementTotal = asNumber(
+    item.engagementTotal,
+    likeCount + replyCount + repostCount + quoteCount
+  );
+
+  return {
+    id,
+    url,
+    text: item.text ?? item.caption ?? "",
+    timestamp,
+    username,
+    full_name: fullName,
+    like_count: likeCount,
+    reply_count: replyCount,
+    repost_count: repostCount,
+    quote_count: quoteCount,
+    reshare_count: reshareCount,
+    engagement_total: engagementTotal,
+    is_reply: Boolean(item.isReply),
+    is_quote_post: Boolean(item.isQuotePost),
+    media_type: item.mediaType ?? item.media_type ?? null,
+    image_url: item.imageUrl ?? (Array.isArray(item.images) ? item.images[0] : null) ?? null,
+    video_url: item.videoUrl ?? (Array.isArray(item.videos) ? item.videos[0] : null) ?? null,
+    author_profile_url: item.authorProfileUrl ?? item.profileUrl ?? null,
+    author_verified: Boolean(item.authorIsVerified ?? item.isVerified),
+    search_surface: item.searchSurface ?? item.searchType ?? null,
+    source: provider,
+  };
+}
+
+function dedupePosts(posts) {
+  const seen = new Set();
+  const out = [];
+  for (const post of posts) {
+    const key = post.id || post.url || `${post.username || ""}:${post.timestamp || ""}:${post.text || ""}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(post);
+  }
+  return out;
+}
+
+function sortPosts(posts, sortBy) {
+  const now = Date.now();
+  const maxEng = Math.max(1, ...posts.map((p) => asNumber(p.engagement_total)));
+  const withScore = posts.map((p) => {
+    const t = new Date(p.timestamp || 0).getTime();
+    const ageHours = Number.isFinite(t) && t > 0 ? Math.max(0, (now - t) / 3_600_000) : 999999;
+    const recencyScore = Math.exp(-ageHours / (24 * 14));
+    const engagementScore = Math.log1p(asNumber(p.engagement_total)) / Math.log1p(maxEng);
+    const balancedScore = 0.55 * recencyScore + 0.45 * engagementScore;
+    return { ...p, _balanced_score: balancedScore };
+  });
+
+  if (sortBy === "RECENT") {
+    withScore.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+  } else if (sortBy === "ENGAGEMENT") {
+    withScore.sort((a, b) => b.engagement_total - a.engagement_total);
+  } else {
+    withScore.sort((a, b) => b._balanced_score - a._balanced_score);
+  }
+
+  return withScore.map(({ _balanced_score, ...p }) => p);
+}
+
+function dateOnly(value) {
+  if (!value) return undefined;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value).slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysFromSince(since, fallback) {
+  if (!since) return fallback;
+  const d = new Date(since);
+  if (Number.isNaN(d.getTime())) return fallback;
+  const days = Math.ceil((Date.now() - d.getTime()) / 86_400_000);
+  return Math.max(1, Math.min(3650, days));
+}
+
+async function searchWithPrimary({ query, limit, searchType, searchMode, includeReplies, minLikes, since }) {
+  const fetchLimit = Math.max(limit, Math.min(100, Math.max(25, limit * 3)));
+  const input = {
+    keywords: [query],
+    searchType: searchMode === "TAG" ? "tags" : searchType === "TOP" ? "top" : "both",
+    passesPerSurface: searchType === "RECENT" ? 2 : 1,
+    maxPostsPerKeyword: fetchLimit,
+    maxItems: fetchLimit,
+    minLikes,
+    postedWithinDays: daysFromSince(since, searchType === "RECENT" ? 30 : 0),
+    excludeReplies: !includeReplies,
+    onlyWithLinks: false,
+    requestConcurrency: 1,
+    proxyConfiguration: { useApifyProxy: true },
+  };
+  const rows = await apifyRunActor(APIFY_PRIMARY_ACTOR, input, { billingLimit: fetchLimit });
+  return rows.map((x) => normalizeApifyPost(x, "apify_primary"));
+}
+
+async function searchWithFallback({ query, limit, searchType, searchMode, includeReplies, since, until }) {
+  const fetchLimit = Math.max(limit, Math.min(100, Math.max(20, limit * 2)));
+  const input = {
+    searchQueries: [query],
+    searchType: searchMode === "TAG" ? "tags" : searchType.toLowerCase(),
+    maxItems: fetchLimit,
+    includeReplies,
+    ...(since ? { postedAfter: dateOnly(since) } : {}),
+    ...(until ? { postedBefore: dateOnly(until) } : {}),
+    proxyConfiguration: { useApifyProxy: true },
+  };
+  const rows = await apifyRunActor(APIFY_FALLBACK_ACTOR, input, { billingLimit: fetchLimit });
+  return rows.map((x) => normalizeApifyPost(x, "apify_fallback"));
+}
+
 const accountField = (accountKeys.length > 0 ? z.enum(accountKeys) : z.string())
   .default(accountKeys[0] || "akun_1")
   .describe(
@@ -153,75 +389,164 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // MCP server + tools
 // ---------------------------------------------------------------------------
 function createServer() {
-  const server = new McpServer({ name: "threads-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "threads-mcp", version: "1.1.0" });
 
   server.registerTool(
     "search_threads",
     {
-      title: "Search public Threads posts by keyword",
+      title: "Search public Threads posts",
       description:
-        "Search Threads via Meta's official /keyword_search endpoint. Public discovery requires the threads_keyword_search scope on the current token and the appropriate Meta access/approval. Use RECENT for newest posts and TOP for Meta-ranked results.",
+        "Search PUBLIC Threads posts through Apify. This does not require Meta threads_keyword_search permission. The server tries the low-cost Actor first and automatically falls back to a second Actor if the first fails or returns too few results. Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting when you want a mix of freshness + engagement.",
       inputSchema: {
-        account: accountField,
-        query: z.string().min(1).describe("Keyword or topic tag to search for"),
+        account: accountField.optional().describe(
+          "Optional/backward compatibility only. Public Apify search does not use your Threads account token."
+        ),
+        query: z.string().min(1).describe("Keyword, phrase, or hashtag to search on public Threads"),
         search_type: z
           .enum(["TOP", "RECENT"])
           .default("RECENT")
-          .describe("TOP = Meta-ranked/relevant results, RECENT = newest first"),
+          .describe("TOP = relevance/popularity, RECENT = prioritize newer posts"),
         search_mode: z
           .enum(["KEYWORD", "TAG"])
           .default("KEYWORD")
-          .describe("KEYWORD = normal keyword search, TAG = topic-tag search"),
+          .describe("KEYWORD = normal search, TAG = hashtag/topic-tag surface"),
         limit: z
           .number()
           .int()
           .min(1)
-          .max(100)
-          .default(25)
-          .describe("Maximum records requested from Meta (1-100)"),
-        media_type: z
-          .enum(["TEXT", "IMAGE", "VIDEO"])
-          .optional()
-          .describe("Optional filter by media type"),
+          .max(50)
+          .default(10)
+          .describe("How many final posts to return (1-50). The Actor may fetch more internally for ranking."),
+        sort_by: z
+          .enum(["BALANCED", "RECENT", "ENGAGEMENT"])
+          .default("BALANCED")
+          .describe("BALANCED mixes freshness and engagement; RECENT newest first; ENGAGEMENT busiest first"),
+        include_replies: z
+          .boolean()
+          .default(false)
+          .describe("Include replies that match the search. false = prefer standalone posts."),
+        min_likes: z
+          .number()
+          .int()
+          .min(0)
+          .default(0)
+          .describe("Optional minimum likes filter for the primary Actor"),
         since: z
           .string()
           .optional()
-          .describe("Optional start date/time accepted by Meta, e.g. 2026-09-01"),
+          .describe("Optional start date/time, e.g. 2026-09-01. Useful for recent monitoring."),
         until: z
           .string()
           .optional()
-          .describe("Optional end date/time accepted by Meta, e.g. 2026-09-17"),
+          .describe("Optional end date/time, e.g. 2026-09-18"),
+        fallback_on_low_results: z
+          .boolean()
+          .default(true)
+          .describe("Automatically try the backup Actor when the cheap Actor fails or returns fewer results than requested"),
       },
     },
-    async ({ account, query, search_type, search_mode, limit, media_type, since, until }) => {
-      try {
-        const { accessToken } = getAccount(account);
-        const data = await threadsFetch(accessToken, "/keyword_search", {
-          params: {
-            q: query.trim(),
-            search_type,
-            search_mode,
-            limit,
-            ...(media_type ? { media_type } : {}),
-            ...(since ? { since } : {}),
-            ...(until ? { until } : {}),
-            fields: "id,text,media_type,permalink,timestamp,username,has_replies,is_quote_post,is_reply",
-          },
-        });
-
-        const nextCursor = data.paging?.cursors?.after || null;
+    async ({
+      query,
+      search_type,
+      search_mode,
+      limit,
+      sort_by,
+      include_replies,
+      min_likes,
+      since,
+      until,
+      fallback_on_low_results,
+    }) => {
+      if (!APIFY_TOKEN) {
         return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "APIFY_TOKEN belum ada di environment Render. Tambahkan APIFY_TOKEN lalu redeploy.",
+            },
+          ],
+        };
+      }
+
+      const attempts = [];
+      let combined = [];
+      let primaryFailed = false;
+
+      try {
+        const primary = await searchWithPrimary({
+          query: query.trim(),
+          limit,
+          searchType: search_type,
+          searchMode: search_mode,
+          includeReplies: include_replies,
+          minLikes: min_likes,
+          since,
+        });
+        attempts.push({ actor: APIFY_PRIMARY_ACTOR, status: "ok", results: primary.length });
+        combined.push(...primary);
+      } catch (err) {
+        primaryFailed = true;
+        attempts.push({
+          actor: APIFY_PRIMARY_ACTOR,
+          status: "error",
+          error: err?.message || String(err),
+        });
+      }
+
+      const primaryCount = dedupePosts(combined).length;
+      const shouldFallback =
+        fallback_on_low_results && (primaryFailed || primaryCount < Math.min(limit, 10));
+
+      if (shouldFallback) {
+        try {
+          const fallback = await searchWithFallback({
+            query: query.trim(),
+            limit,
+            searchType: search_type,
+            searchMode: search_mode,
+            includeReplies: include_replies,
+            since,
+            until,
+          });
+          attempts.push({ actor: APIFY_FALLBACK_ACTOR, status: "ok", results: fallback.length });
+          combined.push(...fallback);
+        } catch (err) {
+          attempts.push({
+            actor: APIFY_FALLBACK_ACTOR,
+            status: "error",
+            error: err?.message || String(err),
+          });
+        }
+      }
+
+      // Apply exact date bounds locally as a second safety layer because Actor
+      // search surfaces can contain mixed-age results.
+      const sinceMs = since ? new Date(since).getTime() : null;
+      const untilMs = until ? new Date(until).getTime() : null;
+      let posts = dedupePosts(combined).filter((p) => {
+        if (!p.timestamp) return !since && !until;
+        const t = new Date(p.timestamp).getTime();
+        if (!Number.isFinite(t)) return !since && !until;
+        if (Number.isFinite(sinceMs) && t < sinceMs) return false;
+        if (Number.isFinite(untilMs) && t > untilMs) return false;
+        return true;
+      });
+
+      posts = sortPosts(posts, sort_by).slice(0, limit);
+
+      if (posts.length === 0 && attempts.every((a) => a.status === "error")) {
+        return {
+          isError: true,
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
                   query,
-                  search_type,
-                  search_mode,
-                  results: data.data || [],
-                  next_cursor: nextCursor,
-                  has_more: Boolean(nextCursor),
+                  error: "Kedua Apify Actor gagal.",
+                  attempts,
+                  hint: "Cek APIFY_TOKEN, kredit Apify, atau status Actor di Apify Console.",
                 },
                 null,
                 2
@@ -229,9 +554,90 @@ function createServer() {
             },
           ],
         };
-      } catch (err) {
-        return mcpToolError(err);
       }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                query,
+                provider: "Apify public Threads search",
+                search_type,
+                search_mode,
+                sort_by,
+                returned: posts.length,
+                attempts,
+                note:
+                  "Hasil berasal dari halaman publik Threads yang dibaca oleh Actor Apify, bukan endpoint keyword_search resmi Meta. Search publik dapat tidak lengkap karena Threads membatasi hasil yang terlihat untuk pengunjung logged-out.",
+                results: posts,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "diagnose_apify_search",
+    {
+      title: "Diagnose Apify Threads search",
+      description:
+        "Test whether APIFY_TOKEN works and whether the primary/fallback Threads search Actors can currently return public results.",
+      inputSchema: {
+        query: z.string().min(1).default("threads").describe("Small test query"),
+      },
+    },
+    async ({ query }) => {
+      const report = {
+        token_configured: Boolean(APIFY_TOKEN),
+        primary_actor: APIFY_PRIMARY_ACTOR,
+        fallback_actor: APIFY_FALLBACK_ACTOR,
+        tests: [],
+      };
+      if (!APIFY_TOKEN) {
+        report.tests.push({ status: "error", error: "APIFY_TOKEN missing" });
+        return { isError: true, content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+      }
+
+      try {
+        const rows = await searchWithPrimary({
+          query,
+          limit: 3,
+          searchType: "TOP",
+          searchMode: "KEYWORD",
+          includeReplies: false,
+          minLikes: 0,
+        });
+        report.tests.push({ actor: APIFY_PRIMARY_ACTOR, status: "ok", results: rows.length });
+      } catch (err) {
+        report.tests.push({ actor: APIFY_PRIMARY_ACTOR, status: "error", error: err?.message || String(err) });
+      }
+
+      if (report.tests[0]?.status !== "ok") {
+        try {
+          const rows = await searchWithFallback({
+            query,
+            limit: 3,
+            searchType: "TOP",
+            searchMode: "KEYWORD",
+            includeReplies: false,
+          });
+          report.tests.push({ actor: APIFY_FALLBACK_ACTOR, status: "ok", results: rows.length });
+        } catch (err) {
+          report.tests.push({ actor: APIFY_FALLBACK_ACTOR, status: "error", error: err?.message || String(err) });
+        }
+      }
+
+      const ok = report.tests.some((t) => t.status === "ok");
+      return {
+        ...(ok ? {} : { isError: true }),
+        content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+      };
     }
   );
 
@@ -710,7 +1116,7 @@ app.post("/mcp", async (req, res) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Threads MCP server is running.");
+  res.send(`Threads MCP server is running. Public search: ${APIFY_TOKEN ? "Apify configured" : "APIFY_TOKEN missing"}.`);
 });
 
 // OAuth redirect target — just displays the code so it's easy to copy.
