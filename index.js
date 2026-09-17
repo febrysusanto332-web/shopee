@@ -341,14 +341,124 @@ function daysFromSince(since, fallback) {
   return Math.max(1, Math.min(3650, days));
 }
 
-async function searchWithPrimary({ query, limit, searchType, searchMode, includeReplies, minLikes, since }) {
-  const fetchLimit = Math.max(limit, Math.min(100, Math.max(25, limit * 3)));
+const QUALITY_RANK = { ECONOMY: 1, BALANCED: 2, DEEP: 3 };
+const SEARCH_CACHE = new Map();
+
+function resolveQualityMode(requestedMode, requestContext, query) {
+  if (requestedMode && requestedMode !== "AUTO") return requestedMode;
+
+  const text = `${requestContext || ""} ${query || ""}`.toLowerCase();
+  const economySignals = [
+    "mode economy",
+    "economy mode",
+    "hemat biaya",
+    "paling hemat",
+    "sehemat mungkin",
+    "minimum biaya",
+    "murah saja",
+  ];
+  if (economySignals.some((x) => text.includes(x))) return "ECONOMY";
+
+  const deepSignals = [
+    "mode deep",
+    "deep search",
+    "secara mendalam",
+    "cari mendalam",
+    "benar-benar paling",
+    "benar benar paling",
+    "paling ramai dan relevan",
+    "paling relevan dan ramai",
+    "sebanyak mungkin",
+    "cari lebih luas",
+    "riset mendalam",
+    "cross-check",
+    "cross check",
+    "pilih yang terbaik dari banyak kandidat",
+    "prospek terbaik",
+    "paling bagus untuk prospek",
+  ];
+  if (deepSignals.some((x) => text.includes(x))) return "DEEP";
+
+  return "BALANCED";
+}
+
+function qualityPlan(mode, limit) {
+  if (mode === "ECONOMY") {
+    return {
+      primaryFetch: Math.min(100, Math.max(limit + 3, Math.ceil(limit * 1.25))),
+      fallbackFetch: Math.min(100, Math.max(limit, Math.ceil(limit * 1.25))),
+      fallbackThreshold: 0, // only fall back on an actual primary failure
+    };
+  }
+  if (mode === "DEEP") {
+    return {
+      primaryFetch: Math.min(100, Math.max(35, Math.ceil(limit * 4))),
+      fallbackFetch: Math.min(100, Math.max(20, Math.ceil(limit * 2))),
+      fallbackThreshold: limit, // deep aims to fill the requested count before ranking
+    };
+  }
+  return {
+    primaryFetch: Math.min(100, Math.max(limit + 5, Math.ceil(limit * 1.6))),
+    fallbackFetch: Math.min(100, Math.max(limit, Math.ceil(limit * 1.25))),
+    fallbackThreshold: Math.max(3, Math.ceil(limit * 0.5)),
+  };
+}
+
+function cacheTtlMs(searchType, sortBy) {
+  if (searchType === "RECENT" || sortBy === "RECENT") return 5 * 60 * 1000;
+  if (sortBy === "ENGAGEMENT") return 15 * 60 * 1000;
+  return 30 * 60 * 1000;
+}
+
+function cacheKey({ query, searchType, searchMode, includeReplies, minLikes, since, until }) {
+  return JSON.stringify({
+    q: String(query || "").trim().toLowerCase(),
+    searchType,
+    searchMode,
+    includeReplies: Boolean(includeReplies),
+    minLikes: Number(minLikes || 0),
+    since: since || null,
+    until: until || null,
+  });
+}
+
+function getCachedSearch(key, requestedMode, limit, ttlMs) {
+  const cached = SEARCH_CACHE.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.createdAt > ttlMs) {
+    SEARCH_CACHE.delete(key);
+    return null;
+  }
+  if ((QUALITY_RANK[cached.qualityMode] || 0) < (QUALITY_RANK[requestedMode] || 0)) return null;
+  if (!Array.isArray(cached.posts) || cached.posts.length < limit) return null;
+  return cached;
+}
+
+function setCachedSearch(key, qualityMode, posts) {
+  if (!Array.isArray(posts) || posts.length === 0) return;
+  const old = SEARCH_CACHE.get(key);
+  if (old && (QUALITY_RANK[old.qualityMode] || 0) > (QUALITY_RANK[qualityMode] || 0)) return;
+  SEARCH_CACHE.set(key, {
+    createdAt: Date.now(),
+    qualityMode,
+    posts: dedupePosts(posts).slice(0, 200),
+  });
+
+  // Keep memory bounded on long-running Render instances.
+  if (SEARCH_CACHE.size > 150) {
+    const oldest = [...SEARCH_CACHE.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+    if (oldest) SEARCH_CACHE.delete(oldest[0]);
+  }
+}
+
+async function searchWithPrimary({ query, fetchLimit, searchType, searchMode, includeReplies, minLikes, since }) {
+  const safeLimit = Math.max(1, Math.min(100, fetchLimit));
   const input = {
     keywords: [query],
     searchType: searchMode === "TAG" ? "tags" : searchType === "TOP" ? "top" : "both",
     passesPerSurface: searchType === "RECENT" ? 2 : 1,
-    maxPostsPerKeyword: fetchLimit,
-    maxItems: fetchLimit,
+    maxPostsPerKeyword: safeLimit,
+    maxItems: safeLimit,
     minLikes,
     postedWithinDays: daysFromSince(since, searchType === "RECENT" ? 30 : 0),
     excludeReplies: !includeReplies,
@@ -356,22 +466,22 @@ async function searchWithPrimary({ query, limit, searchType, searchMode, include
     requestConcurrency: 1,
     proxyConfiguration: { useApifyProxy: true },
   };
-  const rows = await apifyRunActor(APIFY_PRIMARY_ACTOR, input, { billingLimit: fetchLimit });
+  const rows = await apifyRunActor(APIFY_PRIMARY_ACTOR, input, { billingLimit: safeLimit });
   return rows.map((x) => normalizeApifyPost(x, "apify_primary"));
 }
 
-async function searchWithFallback({ query, limit, searchType, searchMode, includeReplies, since, until }) {
-  const fetchLimit = Math.max(limit, Math.min(100, Math.max(20, limit * 2)));
+async function searchWithFallback({ query, fetchLimit, searchType, searchMode, includeReplies, since, until }) {
+  const safeLimit = Math.max(1, Math.min(100, fetchLimit));
   const input = {
     searchQueries: [query],
     searchType: searchMode === "TAG" ? "tags" : searchType.toLowerCase(),
-    maxItems: fetchLimit,
+    maxItems: safeLimit,
     includeReplies,
     ...(since ? { postedAfter: dateOnly(since) } : {}),
     ...(until ? { postedBefore: dateOnly(until) } : {}),
     proxyConfiguration: { useApifyProxy: true },
   };
-  const rows = await apifyRunActor(APIFY_FALLBACK_ACTOR, input, { billingLimit: fetchLimit });
+  const rows = await apifyRunActor(APIFY_FALLBACK_ACTOR, input, { billingLimit: safeLimit });
   return rows.map((x) => normalizeApifyPost(x, "apify_fallback"));
 }
 
@@ -389,14 +499,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // MCP server + tools
 // ---------------------------------------------------------------------------
 function createServer() {
-  const server = new McpServer({ name: "threads-mcp", version: "1.1.0" });
+  const server = new McpServer({ name: "threads-mcp", version: "1.2.0" });
 
   server.registerTool(
     "search_threads",
     {
       title: "Search public Threads posts",
       description:
-        "Search PUBLIC Threads posts through Apify. This does not require Meta threads_keyword_search permission. The server tries the low-cost Actor first and automatically falls back to a second Actor if the first fails or returns too few results. Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting when you want a mix of freshness + engagement.",
+        "Search PUBLIC Threads posts through Apify. Default quality_mode=AUTO: ordinary searches resolve to BALANCED, explicit cost-saving requests to ECONOMY, and requests for a deep/wide search or the truly most relevant/busiest posts to DEEP. The server uses a low-cost primary Actor, a conservative fallback policy, and short in-memory caching to reduce Apify spend. Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting for freshness + engagement.",
       inputSchema: {
         account: accountField.optional().describe(
           "Optional/backward compatibility only. Public Apify search does not use your Threads account token."
@@ -439,10 +549,24 @@ function createServer() {
           .string()
           .optional()
           .describe("Optional end date/time, e.g. 2026-09-18"),
+        quality_mode: z
+          .enum(["AUTO", "ECONOMY", "BALANCED", "DEEP"])
+          .default("AUTO")
+          .describe(
+            "AUTO is recommended: use ECONOMY only when the user explicitly asks to minimize cost; use DEEP when the user asks for a deep/wide search, the truly most relevant/busiest posts, as many candidates as possible, cross-checking, or the best prospects; otherwise AUTO resolves to BALANCED."
+          ),
+        request_context: z
+          .string()
+          .optional()
+          .describe(
+            "Optional short copy of the user's original search request. In AUTO mode, pass the user's wording here so the server can detect intents like 'benar-benar paling ramai dan relevan' -> DEEP or 'mode economy' -> ECONOMY."
+          ),
         fallback_on_low_results: z
           .boolean()
           .default(true)
-          .describe("Automatically try the backup Actor when the cheap Actor fails or returns fewer results than requested"),
+          .describe(
+            "Allow the backup Actor under the selected quality policy. ECONOMY uses it only if the primary Actor fails; BALANCED only if results are very sparse; DEEP may use it whenever needed to fill the requested count."
+          ),
       },
     },
     async ({
@@ -455,6 +579,8 @@ function createServer() {
       min_likes,
       since,
       until,
+      quality_mode,
+      request_context,
       fallback_on_low_results,
     }) => {
       if (!APIFY_TOKEN) {
@@ -469,6 +595,52 @@ function createServer() {
         };
       }
 
+      const resolvedQualityMode = resolveQualityMode(quality_mode, request_context, query);
+      const plan = qualityPlan(resolvedQualityMode, limit);
+      const ttlMs = cacheTtlMs(search_type, sort_by);
+      const key = cacheKey({
+        query,
+        searchType: search_type,
+        searchMode: search_mode,
+        includeReplies: include_replies,
+        minLikes: min_likes,
+        since,
+        until,
+      });
+
+      const cached = getCachedSearch(key, resolvedQualityMode, limit, ttlMs);
+      if (cached) {
+        const cachedPosts = sortPosts(cached.posts, sort_by).slice(0, limit);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  query,
+                  provider: "Apify public Threads search",
+                  quality_mode_requested: quality_mode,
+                  quality_mode_resolved: resolvedQualityMode,
+                  cache_hit: true,
+                  cache_age_seconds: Math.round((Date.now() - cached.createdAt) / 1000),
+                  cache_ttl_seconds: Math.round(ttlMs / 1000),
+                  search_type,
+                  search_mode,
+                  sort_by,
+                  returned: cachedPosts.length,
+                  attempts: [],
+                  note:
+                    "Hasil diambil dari cache in-memory MCP untuk menghemat kredit Apify. Cache RECENT sekitar 5 menit; engagement sekitar 15 menit; TOP/BALANCED sekitar 30 menit.",
+                  results: cachedPosts,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       const attempts = [];
       let combined = [];
       let primaryFailed = false;
@@ -476,45 +648,67 @@ function createServer() {
       try {
         const primary = await searchWithPrimary({
           query: query.trim(),
-          limit,
+          fetchLimit: plan.primaryFetch,
           searchType: search_type,
           searchMode: search_mode,
           includeReplies: include_replies,
           minLikes: min_likes,
           since,
         });
-        attempts.push({ actor: APIFY_PRIMARY_ACTOR, status: "ok", results: primary.length });
+        attempts.push({
+          actor: APIFY_PRIMARY_ACTOR,
+          status: "ok",
+          requested_candidates: plan.primaryFetch,
+          results: primary.length,
+        });
         combined.push(...primary);
       } catch (err) {
         primaryFailed = true;
         attempts.push({
           actor: APIFY_PRIMARY_ACTOR,
           status: "error",
+          requested_candidates: plan.primaryFetch,
           error: err?.message || String(err),
         });
       }
 
       const primaryCount = dedupePosts(combined).length;
-      const shouldFallback =
-        fallback_on_low_results && (primaryFailed || primaryCount < Math.min(limit, 10));
+      let shouldFallback = false;
+      if (fallback_on_low_results) {
+        if (primaryFailed) {
+          shouldFallback = true;
+        } else if (resolvedQualityMode === "DEEP") {
+          shouldFallback = primaryCount < plan.fallbackThreshold;
+        } else if (resolvedQualityMode === "BALANCED") {
+          shouldFallback = primaryCount < plan.fallbackThreshold;
+        } else {
+          shouldFallback = false;
+        }
+      }
 
       if (shouldFallback) {
         try {
           const fallback = await searchWithFallback({
             query: query.trim(),
-            limit,
+            fetchLimit: plan.fallbackFetch,
             searchType: search_type,
             searchMode: search_mode,
             includeReplies: include_replies,
             since,
             until,
           });
-          attempts.push({ actor: APIFY_FALLBACK_ACTOR, status: "ok", results: fallback.length });
+          attempts.push({
+            actor: APIFY_FALLBACK_ACTOR,
+            status: "ok",
+            requested_candidates: plan.fallbackFetch,
+            results: fallback.length,
+          });
           combined.push(...fallback);
         } catch (err) {
           attempts.push({
             actor: APIFY_FALLBACK_ACTOR,
             status: "error",
+            requested_candidates: plan.fallbackFetch,
             error: err?.message || String(err),
           });
         }
@@ -533,6 +727,9 @@ function createServer() {
         return true;
       });
 
+      // Cache the full candidate pool before the final slice. A DEEP cache can
+      // satisfy later BALANCED/ECONOMY requests without another Apify run.
+      setCachedSearch(key, resolvedQualityMode, posts);
       posts = sortPosts(posts, sort_by).slice(0, limit);
 
       if (posts.length === 0 && attempts.every((a) => a.status === "error")) {
@@ -564,6 +761,11 @@ function createServer() {
               {
                 query,
                 provider: "Apify public Threads search",
+                quality_mode_requested: quality_mode,
+                quality_mode_resolved: resolvedQualityMode,
+                cache_hit: false,
+                cache_ttl_seconds: Math.round(ttlMs / 1000),
+                candidate_plan: plan,
                 search_type,
                 search_mode,
                 sort_by,
@@ -607,7 +809,7 @@ function createServer() {
       try {
         const rows = await searchWithPrimary({
           query,
-          limit: 3,
+          fetchLimit: 3,
           searchType: "TOP",
           searchMode: "KEYWORD",
           includeReplies: false,
@@ -622,7 +824,7 @@ function createServer() {
         try {
           const rows = await searchWithFallback({
             query,
-            limit: 3,
+            fetchLimit: 3,
             searchType: "TOP",
             searchMode: "KEYWORD",
             includeReplies: false,
