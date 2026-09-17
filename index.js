@@ -53,10 +53,22 @@ function getAccount(accountKey) {
 // ---------------------------------------------------------------------------
 // Small helper for calling the Threads Graph API
 // ---------------------------------------------------------------------------
+class ThreadsApiError extends Error {
+  constructor(message, { status, data, path } = {}) {
+    super(message);
+    this.name = "ThreadsApiError";
+    this.status = status;
+    this.data = data;
+    this.path = path;
+  }
+}
+
 async function threadsFetch(accessToken, path, { method = "GET", params = {}, body } = {}) {
   const url = new URL(`${GRAPH_BASE}${path}`);
   for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
   }
   url.searchParams.set("access_token", accessToken ?? "");
 
@@ -66,11 +78,65 @@ async function threadsFetch(accessToken, path, { method = "GET", params = {}, bo
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  const data = await res.json().catch(() => ({}));
+  // Meta occasionally returns a 5xx with either a tiny JSON error or even an
+  // empty body. Read as text first so the original error is never hidden by a
+  // JSON parse failure.
+  const raw = await res.text();
+  let data = {};
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { raw };
+    }
+  }
+
   if (!res.ok) {
-    throw new Error(`Threads API error (${res.status}): ${JSON.stringify(data)}`);
+    const graphError = data?.error || {};
+    const graphCode = graphError.code ?? "unknown";
+    const graphSubcode = graphError.error_subcode ? `/${graphError.error_subcode}` : "";
+    const graphMessage = graphError.message || data?.raw || res.statusText || "Unknown Threads API error";
+
+    throw new ThreadsApiError(
+      `Threads API ${res.status} (code ${graphCode}${graphSubcode}) on ${path}: ${graphMessage}`,
+      { status: res.status, data, path }
+    );
   }
   return data;
+}
+
+function explainThreadsError(err) {
+  if (!(err instanceof ThreadsApiError)) {
+    return String(err?.message || err);
+  }
+
+  const graphError = err.data?.error || {};
+  const code = Number(graphError.code);
+  const message = graphError.message || err.message;
+
+  if (err.path === "/keyword_search" && (code === 1 || code === 10)) {
+    return [
+      `Keyword Search ditolak oleh Meta (HTTP ${err.status}, code ${code}: ${message}).`,
+      "Endpoint dan parameter MCP sudah benar; error ini terjadi langsung di graph.threads.net.",
+      "Periksa Meta App -> Threads API -> Permissions/Use cases: threads_keyword_search harus aktif pada app DAN scope itu harus ada pada access token yang sekarang dipakai.",
+      "Jika permission baru saja diaktifkan, buat/authorize token BARU dengan threads_basic + threads_keyword_search lalu ganti THREADS_ACCESS_TOKEN_N di Render dan redeploy.",
+      "Untuk mencari postingan publik milik akun lain, threads_keyword_search juga memerlukan akses/approval Meta yang sesuai (Advanced Access/App Review).",
+      graphError.fbtrace_id ? `fbtrace_id: ${graphError.fbtrace_id}` : null,
+    ].filter(Boolean).join("\n");
+  }
+
+  if (code === 190) {
+    return `Access token Threads tidak valid/kedaluwarsa. Buat token baru, update Environment Variable di Render, lalu redeploy. Detail: ${message}`;
+  }
+
+  return err.message;
+}
+
+function mcpToolError(err) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: explainThreadsError(err) }],
+  };
 }
 
 const accountField = (accountKeys.length > 0 ? z.enum(accountKeys) : z.string())
@@ -94,31 +160,131 @@ function createServer() {
     {
       title: "Search public Threads posts by keyword",
       description:
-        "Search for public Threads posts matching a keyword. Returned posts can be replied to directly using reply_to_post afterwards. Note: without the threads_keyword_search permission approved, search is limited to the account's own posts; results are also capped at roughly 20-30 per call by Threads itself.",
+        "Search Threads via Meta's official /keyword_search endpoint. Public discovery requires the threads_keyword_search scope on the current token and the appropriate Meta access/approval. Use RECENT for newest posts and TOP for Meta-ranked results.",
       inputSchema: {
         account: accountField,
-        query: z.string().min(1).describe("Keyword to search for"),
+        query: z.string().min(1).describe("Keyword or topic tag to search for"),
         search_type: z
           .enum(["TOP", "RECENT"])
           .default("RECENT")
-          .describe("TOP = most relevant/popular, RECENT = newest first"),
+          .describe("TOP = Meta-ranked/relevant results, RECENT = newest first"),
+        search_mode: z
+          .enum(["KEYWORD", "TAG"])
+          .default("KEYWORD")
+          .describe("KEYWORD = normal keyword search, TAG = topic-tag search"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(25)
+          .describe("Maximum records requested from Meta (1-100)"),
         media_type: z
           .enum(["TEXT", "IMAGE", "VIDEO"])
           .optional()
           .describe("Optional filter by media type"),
+        since: z
+          .string()
+          .optional()
+          .describe("Optional start date/time accepted by Meta, e.g. 2026-09-01"),
+        until: z
+          .string()
+          .optional()
+          .describe("Optional end date/time accepted by Meta, e.g. 2026-09-17"),
       },
     },
-    async ({ account, query, search_type, media_type }) => {
-      const { accessToken } = getAccount(account);
-      const data = await threadsFetch(accessToken, "/keyword_search", {
-        params: {
-          q: query,
-          search_type,
-          ...(media_type ? { media_type } : {}),
-          fields: "id,text,media_type,permalink,timestamp,username,has_replies,is_quote_post,is_reply",
-        },
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ account, query, search_type, search_mode, limit, media_type, since, until }) => {
+      try {
+        const { accessToken } = getAccount(account);
+        const data = await threadsFetch(accessToken, "/keyword_search", {
+          params: {
+            q: query.trim(),
+            search_type,
+            search_mode,
+            limit,
+            ...(media_type ? { media_type } : {}),
+            ...(since ? { since } : {}),
+            ...(until ? { until } : {}),
+            fields: "id,text,media_type,permalink,timestamp,username,has_replies,is_quote_post,is_reply",
+          },
+        });
+
+        const nextCursor = data.paging?.cursors?.after || null;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  query,
+                  search_type,
+                  search_mode,
+                  results: data.data || [],
+                  next_cursor: nextCursor,
+                  has_more: Boolean(nextCursor),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return mcpToolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "diagnose_threads_search",
+    {
+      title: "Diagnose Threads keyword-search access",
+      description:
+        "Check whether the selected Threads token itself works and whether Meta currently allows /keyword_search. Use this before repeatedly retrying a failing search.",
+      inputSchema: {
+        account: accountField,
+      },
+    },
+    async ({ account }) => {
+      const { accessToken, label } = getAccount(account);
+      const report = { account, label, basic_api: null, keyword_search: null };
+
+      try {
+        const me = await threadsFetch(accessToken, "/me", {
+          params: { fields: "id,username" },
+        });
+        report.basic_api = { ok: true, id: me.id, username: me.username };
+      } catch (err) {
+        report.basic_api = { ok: false, error: explainThreadsError(err) };
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+        };
+      }
+
+      try {
+        const probe = await threadsFetch(accessToken, "/keyword_search", {
+          params: {
+            q: "threads",
+            search_type: "RECENT",
+            search_mode: "KEYWORD",
+            limit: 1,
+            fields: "id,text,permalink,timestamp,username",
+          },
+        });
+        report.keyword_search = {
+          ok: true,
+          returned: Array.isArray(probe.data) ? probe.data.length : 0,
+          note:
+            "Endpoint berhasil. Jika hasil publik tetap tidak muncul, periksa apakah app sudah mendapat akses Meta yang diperlukan untuk public keyword search.",
+        };
+      } catch (err) {
+        report.keyword_search = { ok: false, error: explainThreadsError(err) };
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+      };
     }
   );
 
