@@ -23,6 +23,13 @@ const APIFY_FALLBACK_ACTOR =
   process.env.APIFY_FALLBACK_ACTOR || "logical_scrapers/threads-search-scraper";
 const APIFY_MAX_CHARGE_USD = Number(process.env.APIFY_MAX_CHARGE_USD || "0.50");
 
+// Reserve search provider. It is only used automatically when Apify reports
+// HTTP 402 / exhausted usage. The user-facing response deliberately labels
+// this source only as "Limited Token Creator".
+const LIMITED_TOKEN_API_BASE = "https://api.scrapecreators.com/v1";
+const LIMITED_TOKEN_API_KEY = process.env.SCRAPECREATORS_API_KEY || "";
+const LIMITED_TOKEN_NOTICE = "⚠️ Limited Token Creator sedang digunakan.";
+
 const ACCOUNTS = {};
 for (let i = 1; ; i++) {
   const token = process.env[`THREADS_ACCESS_TOKEN_${i}`];
@@ -242,6 +249,102 @@ async function apifyRunActor(actor, input, { billingLimit = 100 } = {}) {
   return data;
 }
 
+class LimitedTokenError extends Error {
+  constructor(message, { status, data } = {}) {
+    super(message);
+    this.name = "LimitedTokenError";
+    this.status = status;
+    this.data = data;
+  }
+}
+
+function isApifyBudgetExhausted(err) {
+  if (!(err instanceof ApifyError)) return false;
+  const type = String(err?.data?.error?.type || err?.data?.type || "").toLowerCase();
+  const message = String(
+    err?.data?.error?.message || err?.data?.message || err?.message || ""
+  ).toLowerCase();
+
+  if (Number(err.status) === 402) return true;
+  const budgetTypes = new Set([
+    "monthly-usage-limit-too-low",
+    "not-enough-usage-to-run-paid-actor",
+    "limit-reached",
+    "x402-payment-required",
+  ]);
+  if (budgetTypes.has(type)) return true;
+  return [
+    "usage limit",
+    "not enough credits",
+    "insufficient credits",
+    "payment required",
+    "monthly usage",
+    "not enough usage",
+  ].some((needle) => message.includes(needle));
+}
+
+async function limitedTokenThreadsSearch({ query, since, until }) {
+  if (!LIMITED_TOKEN_API_KEY) {
+    throw new LimitedTokenError(
+      "SCRAPECREATORS_API_KEY belum dikonfigurasi di Render. Tambahkan key tersebut agar Limited Token Creator dapat dipakai saat Apify habis."
+    );
+  }
+
+  const url = new URL(`${LIMITED_TOKEN_API_BASE}/threads/search`);
+  url.searchParams.set("query", String(query || "").trim());
+  if (since) url.searchParams.set("start_date", dateOnly(since));
+  if (until) url.searchParams.set("end_date", dateOnly(until));
+  url.searchParams.set("trim", "false");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  let res;
+  try {
+    res = await fetch(url.toString(), {
+      method: "GET",
+      headers: { "x-api-key": LIMITED_TOKEN_API_KEY },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err?.name === "AbortError") {
+      throw new LimitedTokenError("Limited Token Creator timeout setelah 60 detik.");
+    }
+    throw new LimitedTokenError(`Limited Token Creator tidak dapat dihubungi: ${err?.message || err}`);
+  }
+  clearTimeout(timeout);
+
+  const raw = await res.text();
+  let data = null;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { raw };
+    }
+  }
+
+  if (!res.ok) {
+    let msg = data?.error?.message || data?.message || data?.error || data?.raw || res.statusText || "Unknown error";
+    if (res.status === 402) msg = "Limited Token Creator kehabisan kredit.";
+    throw new LimitedTokenError(`Limited Token Creator ${res.status}: ${msg}`, {
+      status: res.status,
+      data,
+    });
+  }
+
+  const rows = Array.isArray(data?.posts) ? data.posts : [];
+  return {
+    rows,
+    creditsRemaining: Number.isFinite(Number(data?.credits_remaining))
+      ? Number(data.credits_remaining)
+      : null,
+    creditsCharged: Number.isFinite(Number(data?.credits_charged))
+      ? Number(data.credits_charged)
+      : null,
+  };
+}
+
 const asNumber = (...values) => {
   for (const value of values) {
     const n = Number(value);
@@ -288,6 +391,83 @@ function normalizeApifyPost(item, provider) {
     author_verified: Boolean(item.authorIsVerified ?? item.isVerified),
     search_surface: item.searchSurface ?? item.searchType ?? null,
     source: provider,
+  };
+}
+
+function epochToIso(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const ms = n > 10_000_000_000 ? n : n * 1000;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function fragmentsToText(item) {
+  const fragments = item?.text_post_app_info?.text_fragments?.fragments;
+  if (!Array.isArray(fragments)) return "";
+  return fragments
+    .map((f) => f?.plaintext || f?.mention_fragment?.username || f?.link_fragment?.url || "")
+    .filter(Boolean)
+    .join("");
+}
+
+function normalizeLimitedTokenPost(item) {
+  const username = item?.user?.username ?? item?.username ?? null;
+  const code = item?.code ?? item?.shortcode ?? null;
+  const text = item?.caption?.text ?? item?.text ?? fragmentsToText(item);
+  const likeCount = asNumber(item?.like_count, item?.likeCount);
+  const replyCount = asNumber(
+    item?.text_post_app_info?.direct_reply_count,
+    item?.reply_count,
+    item?.replyCount
+  );
+  const repostCount = asNumber(
+    item?.text_post_app_info?.repost_count,
+    item?.repost_count,
+    item?.repostCount
+  );
+  const quoteCount = asNumber(
+    item?.text_post_app_info?.quote_count,
+    item?.quote_count,
+    item?.quoteCount
+  );
+  const reshareCount = asNumber(
+    item?.text_post_app_info?.reshare_count,
+    item?.reshare_count,
+    item?.reshareCount
+  );
+  const timestamp =
+    item?.timestamp ?? item?.created_at ?? epochToIso(item?.taken_at ?? item?.takenAt);
+  const url =
+    item?.url ??
+    item?.permalink ??
+    (username && code ? `https://www.threads.com/@${username}/post/${code}` : null);
+
+  return {
+    id: String(item?.id ?? item?.pk ?? code ?? ""),
+    url,
+    text: text || "",
+    timestamp,
+    username,
+    full_name: item?.user?.full_name ?? item?.full_name ?? null,
+    like_count: likeCount,
+    reply_count: replyCount,
+    repost_count: repostCount,
+    quote_count: quoteCount,
+    reshare_count: reshareCount,
+    engagement_total: likeCount + replyCount + repostCount + quoteCount,
+    is_reply: Boolean(item?.text_post_app_info?.is_reply ?? item?.is_reply),
+    is_quote_post: Boolean(
+      item?.text_post_app_info?.share_info?.quoted_post ||
+        item?.text_post_app_info?.share_info?.quoted_attachment_post
+    ),
+    media_type: item?.media_type ?? null,
+    image_url: item?.image_versions2?.candidates?.[0]?.url ?? null,
+    video_url: item?.video_versions?.[0]?.url ?? null,
+    author_profile_url: username ? `https://www.threads.com/@${username}` : null,
+    author_verified: Boolean(item?.user?.is_verified),
+    search_surface: "keyword",
+    source: "limited_token_creator",
   };
 }
 
@@ -434,7 +614,7 @@ function getCachedSearch(key, requestedMode, limit, ttlMs) {
   return cached;
 }
 
-function setCachedSearch(key, qualityMode, posts) {
+function setCachedSearch(key, qualityMode, posts, metadata = {}) {
   if (!Array.isArray(posts) || posts.length === 0) return;
   const old = SEARCH_CACHE.get(key);
   if (old && (QUALITY_RANK[old.qualityMode] || 0) > (QUALITY_RANK[qualityMode] || 0)) return;
@@ -442,6 +622,11 @@ function setCachedSearch(key, qualityMode, posts) {
     createdAt: Date.now(),
     qualityMode,
     posts: dedupePosts(posts).slice(0, 200),
+    usedLimitedToken: Boolean(metadata.usedLimitedToken),
+    limitedCreditsRemaining:
+      Number.isFinite(Number(metadata.limitedCreditsRemaining))
+        ? Number(metadata.limitedCreditsRemaining)
+        : null,
   });
 
   // Keep memory bounded on long-running Render instances.
@@ -499,14 +684,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // MCP server + tools
 // ---------------------------------------------------------------------------
 function createServer() {
-  const server = new McpServer({ name: "threads-mcp", version: "1.2.0" });
+  const server = new McpServer({ name: "threads-mcp", version: "1.3.0" });
 
   server.registerTool(
     "search_threads",
     {
       title: "Search public Threads posts",
       description:
-        "Search PUBLIC Threads posts through Apify. Default quality_mode=AUTO: ordinary searches resolve to BALANCED, explicit cost-saving requests to ECONOMY, and requests for a deep/wide search or the truly most relevant/busiest posts to DEEP. The server uses a low-cost primary Actor, a conservative fallback policy, and short in-memory caching to reduce Apify spend. Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting for freshness + engagement.",
+        "Search PUBLIC Threads posts. Default quality_mode=AUTO: ordinary searches resolve to BALANCED, explicit cost-saving requests to ECONOMY, and deep/wide requests to DEEP. Apify is used first; if Apify reports that its monthly usage/credits are exhausted, the server automatically switches to a reserve source and returns the notice 'Limited Token Creator sedang digunakan.' Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting for freshness + engagement.",
       inputSchema: {
         account: accountField.optional().describe(
           "Optional/backward compatibility only. Public Apify search does not use your Threads account token."
@@ -618,7 +803,8 @@ function createServer() {
               text: JSON.stringify(
                 {
                   query,
-                  provider: "Apify public Threads search",
+                  provider: cached.usedLimitedToken ? "Limited Token Creator" : "Primary public Threads search",
+                  ...(cached.usedLimitedToken ? { notice: LIMITED_TOKEN_NOTICE } : {}),
                   quality_mode_requested: quality_mode,
                   quality_mode_resolved: resolvedQualityMode,
                   cache_hit: true,
@@ -629,8 +815,12 @@ function createServer() {
                   sort_by,
                   returned: cachedPosts.length,
                   attempts: [],
-                  note:
-                    "Hasil diambil dari cache in-memory MCP untuk menghemat kredit Apify. Cache RECENT sekitar 5 menit; engagement sekitar 15 menit; TOP/BALANCED sekitar 30 menit.",
+                  note: cached.usedLimitedToken
+                    ? "Hasil diambil dari cache in-memory MCP. Sumber cadangan ber-token terbatas sedang digunakan."
+                    : "Hasil diambil dari cache in-memory MCP untuk menghemat kredit. Cache RECENT sekitar 5 menit; engagement sekitar 15 menit; TOP/BALANCED sekitar 30 menit.",
+                  ...(cached.usedLimitedToken && cached.limitedCreditsRemaining !== null
+                    ? { limited_token_credits_remaining: cached.limitedCreditsRemaining }
+                    : {}),
                   results: cachedPosts,
                 },
                 null,
@@ -644,6 +834,9 @@ function createServer() {
       const attempts = [];
       let combined = [];
       let primaryFailed = false;
+      let apifyBudgetExhausted = false;
+      let usedLimitedToken = false;
+      let limitedCreditsRemaining = null;
 
       try {
         const primary = await searchWithPrimary({
@@ -664,11 +857,13 @@ function createServer() {
         combined.push(...primary);
       } catch (err) {
         primaryFailed = true;
+        apifyBudgetExhausted = isApifyBudgetExhausted(err);
         attempts.push({
           actor: APIFY_PRIMARY_ACTOR,
           status: "error",
           requested_candidates: plan.primaryFetch,
           error: err?.message || String(err),
+          ...(apifyBudgetExhausted ? { budget_exhausted: true } : {}),
         });
       }
 
@@ -686,7 +881,7 @@ function createServer() {
         }
       }
 
-      if (shouldFallback) {
+      if (shouldFallback && !apifyBudgetExhausted) {
         try {
           const fallback = await searchWithFallback({
             query: query.trim(),
@@ -705,10 +900,49 @@ function createServer() {
           });
           combined.push(...fallback);
         } catch (err) {
+          const exhausted = isApifyBudgetExhausted(err);
+          if (exhausted) apifyBudgetExhausted = true;
           attempts.push({
             actor: APIFY_FALLBACK_ACTOR,
             status: "error",
             requested_candidates: plan.fallbackFetch,
+            error: err?.message || String(err),
+            ...(exhausted ? { budget_exhausted: true } : {}),
+          });
+        }
+      }
+
+      // When Apify itself reports HTTP 402 / exhausted monthly usage, switch
+      // immediately to the reserve token source. Do not spend reserve credits
+      // merely because an Actor has a temporary outage or returns few results.
+      if (apifyBudgetExhausted) {
+        try {
+          const reserveQuery =
+            search_mode === "TAG" && !query.trim().startsWith("#")
+              ? `#${query.trim()}`
+              : query.trim();
+          const reserve = await limitedTokenThreadsSearch({
+            query: reserveQuery,
+            since,
+            until,
+          });
+          let reservePosts = reserve.rows.map(normalizeLimitedTokenPost);
+          if (!include_replies) reservePosts = reservePosts.filter((p) => !p.is_reply);
+          if (min_likes > 0) reservePosts = reservePosts.filter((p) => p.like_count >= min_likes);
+          usedLimitedToken = true;
+          limitedCreditsRemaining = reserve.creditsRemaining;
+          attempts.push({
+            source: "Limited Token Creator",
+            status: "ok",
+            results: reservePosts.length,
+            credits_charged: reserve.creditsCharged,
+            credits_remaining: reserve.creditsRemaining,
+          });
+          combined.push(...reservePosts);
+        } catch (err) {
+          attempts.push({
+            source: "Limited Token Creator",
+            status: "error",
             error: err?.message || String(err),
           });
         }
@@ -729,7 +963,10 @@ function createServer() {
 
       // Cache the full candidate pool before the final slice. A DEEP cache can
       // satisfy later BALANCED/ECONOMY requests without another Apify run.
-      setCachedSearch(key, resolvedQualityMode, posts);
+      setCachedSearch(key, resolvedQualityMode, posts, {
+        usedLimitedToken,
+        limitedCreditsRemaining,
+      });
       posts = sortPosts(posts, sort_by).slice(0, limit);
 
       if (posts.length === 0 && attempts.every((a) => a.status === "error")) {
@@ -741,9 +978,13 @@ function createServer() {
               text: JSON.stringify(
                 {
                   query,
-                  error: "Kedua Apify Actor gagal.",
+                  error: apifyBudgetExhausted
+                    ? "Primary search sudah mencapai batas penggunaan dan Limited Token Creator tidak dapat memberikan hasil."
+                    : "Kedua primary search Actor gagal.",
                   attempts,
-                  hint: "Cek APIFY_TOKEN, kredit Apify, atau status Actor di Apify Console.",
+                  hint: apifyBudgetExhausted
+                    ? "Pastikan SCRAPECREATORS_API_KEY sudah ada dan Limited Token Creator masih memiliki kredit."
+                    : "Cek APIFY_TOKEN atau status Actor di Apify Console.",
                 },
                 null,
                 2
@@ -760,7 +1001,8 @@ function createServer() {
             text: JSON.stringify(
               {
                 query,
-                provider: "Apify public Threads search",
+                provider: usedLimitedToken ? "Limited Token Creator" : "Primary public Threads search",
+                ...(usedLimitedToken ? { notice: LIMITED_TOKEN_NOTICE } : {}),
                 quality_mode_requested: quality_mode,
                 quality_mode_resolved: resolvedQualityMode,
                 cache_hit: false,
@@ -771,8 +1013,12 @@ function createServer() {
                 sort_by,
                 returned: posts.length,
                 attempts,
-                note:
-                  "Hasil berasal dari halaman publik Threads yang dibaca oleh Actor Apify, bukan endpoint keyword_search resmi Meta. Search publik dapat tidak lengkap karena Threads membatasi hasil yang terlihat untuk pengunjung logged-out.",
+                note: usedLimitedToken
+                  ? "Primary search sudah mencapai batas penggunaan. Limited Token Creator dipakai otomatis untuk request ini. Sumber cadangan ini maksimal sekitar 10 hasil per keyword dalam satu request."
+                  : "Search publik dapat tidak lengkap karena Threads membatasi hasil yang terlihat untuk pengunjung logged-out.",
+                ...(usedLimitedToken && limitedCreditsRemaining !== null
+                  ? { limited_token_credits_remaining: limitedCreditsRemaining }
+                  : {}),
                 results: posts,
               },
               null,
@@ -799,6 +1045,7 @@ function createServer() {
         token_configured: Boolean(APIFY_TOKEN),
         primary_actor: APIFY_PRIMARY_ACTOR,
         fallback_actor: APIFY_FALLBACK_ACTOR,
+        limited_token_configured: Boolean(LIMITED_TOKEN_API_KEY),
         tests: [],
       };
       if (!APIFY_TOKEN) {
