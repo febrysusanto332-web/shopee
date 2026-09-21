@@ -521,6 +521,74 @@ function daysFromSince(since, fallback) {
   return Math.max(1, Math.min(3650, days));
 }
 
+// Threads' logged-out search is intentionally shallow and can miss niche/low-engagement
+// posts that are visible to a signed-in user. When an exact phrase returns nothing,
+// generate a few conservative variants and let the second Actor search ALL surfaces.
+const QUERY_STOPWORDS = new Set([
+  "yang", "dan", "atau", "di", "ke", "dari", "untuk", "dengan", "pada", "ini", "itu",
+  "coba", "cari", "carikan", "keyword", "posting", "postingan", "threads", "thread"
+]);
+
+function searchTokens(query) {
+  return String(query || "")
+    .toLowerCase()
+    .replace(/[#@]/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !QUERY_STOPWORDS.has(t));
+}
+
+function buildRescueQueries(query) {
+  const base = String(query || "").trim();
+  const tokens = [...new Set(searchTokens(base))];
+  const out = [];
+  const add = (q) => {
+    q = String(q || "").trim();
+    if (!q || q.toLowerCase() === base.toLowerCase()) return;
+    if (!out.some((x) => x.toLowerCase() === q.toLowerCase())) out.push(q);
+  };
+
+  // Reverse a two-word phrase because Threads sometimes ranks a different token order.
+  if (tokens.length === 2) add(`${tokens[1]} ${tokens[0]}`);
+
+  // Two-token combinations preserve intent while being less strict than the full phrase.
+  for (let i = 0; i < tokens.length; i++) {
+    for (let j = i + 1; j < tokens.length; j++) {
+      add(`${tokens[i]} ${tokens[j]}`);
+      if (out.length >= 4) return out;
+    }
+  }
+
+  // Last-resort single-token probes for a two-word niche query. Results are filtered
+  // locally so broad matches are not returned unless the original words are present.
+  if (tokens.length === 2) {
+    add(tokens[0]);
+    add(tokens[1]);
+  }
+  return out.slice(0, 4);
+}
+
+function queryMatchInfo(post, originalQuery) {
+  const tokens = [...new Set(searchTokens(originalQuery))];
+  if (!tokens.length) return { matched: 0, total: 0, ratio: 1 };
+  const hay = String(`${post?.text || ""} ${post?.username || ""}`).toLowerCase();
+  const matched = tokens.filter((t) => hay.includes(t)).length;
+  return { matched, total: tokens.length, ratio: matched / tokens.length };
+}
+
+function keepRescueRelevant(posts, originalQuery) {
+  const tokens = [...new Set(searchTokens(originalQuery))];
+  if (tokens.length <= 1) return posts;
+  const minMatched = Math.min(2, tokens.length);
+  return posts
+    .map((p) => {
+      const m = queryMatchInfo(p, originalQuery);
+      return { ...p, query_match_tokens: m.matched, query_match_ratio: Number(m.ratio.toFixed(3)) };
+    })
+    .filter((p) => p.query_match_tokens >= minMatched);
+}
+
 const QUALITY_RANK = { ECONOMY: 1, BALANCED: 2, DEEP: 3 };
 const SEARCH_CACHE = new Map();
 
@@ -655,11 +723,17 @@ async function searchWithPrimary({ query, fetchLimit, searchType, searchMode, in
   return rows.map((x) => normalizeApifyPost(x, "apify_primary"));
 }
 
-async function searchWithFallback({ query, fetchLimit, searchType, searchMode, includeReplies, since, until }) {
+async function searchWithFallback({ query, queries, fetchLimit, searchType, searchMode, includeReplies, since, until }) {
   const safeLimit = Math.max(1, Math.min(100, fetchLimit));
+  const searchQueries = Array.isArray(queries) && queries.length
+    ? [...new Set(queries.map((q) => String(q || "").trim()).filter(Boolean))]
+    : [query];
   const input = {
-    searchQueries: [query],
-    searchType: searchMode === "TAG" ? "tags" : searchType.toLowerCase(),
+    searchQueries,
+    // For recall, KEYWORD fallback reads Top + Recent + Tags. Final RECENT/TOP
+    // ordering is done locally after de-duplication. This avoids false zeroes on
+    // niche terms that exist only on one Threads search surface.
+    searchType: searchMode === "TAG" ? "tags" : "all",
     maxItems: safeLimit,
     includeReplies,
     ...(since ? { postedAfter: dateOnly(since) } : {}),
@@ -691,7 +765,7 @@ function createServer() {
     {
       title: "Search public Threads posts",
       description:
-        "Search PUBLIC Threads posts. Default quality_mode=AUTO: ordinary searches resolve to BALANCED, explicit cost-saving requests to ECONOMY, and deep/wide requests to DEEP. Apify is used first; if Apify reports that its monthly usage/credits are exhausted, the server automatically switches to a reserve source and returns the notice 'Limited Token Creator sedang digunakan.' Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting for freshness + engagement.",
+        "Search PUBLIC Threads posts. Default quality_mode=AUTO. IMPORTANT: public/logged-out search is not exhaustive; returned=0 MUST NOT be interpreted as proof that no matching Threads posts exist. The server automatically tries multiple public search surfaces and conservative query variants when an exact niche phrase returns zero. Apify is used first; if Apify reports that its monthly usage/credits are exhausted, the server switches to a reserve source and returns the notice 'Limited Token Creator sedang digunakan.' Use RECENT for newest, TOP for popular/relevant, and BALANCED sorting for freshness + engagement.",
       inputSchema: {
         account: accountField.optional().describe(
           "Optional/backward compatibility only. Public Apify search does not use your Threads account token."
@@ -912,6 +986,52 @@ function createServer() {
         }
       }
 
+      // ZERO-RESULT RESCUE: a signed-out Threads search can return 0 even when
+      // the signed-in Threads app shows matching low-engagement posts. If both
+      // normal Apify passes produced nothing, try a few conservative variants
+      // across ALL public search surfaces, then locally require the original
+      // query tokens so broad probes do not pollute the answer. This still uses
+      // Apify; Limited Token Creator remains reserved for actual Apify budget exhaustion.
+      if (!apifyBudgetExhausted && dedupePosts(combined).length === 0) {
+        const rescueQueries = buildRescueQueries(query);
+        if (rescueQueries.length > 0) {
+          try {
+            const rescueFetch = Math.min(30, Math.max(limit + 5, 12));
+            const rescue = await searchWithFallback({
+              query: query.trim(),
+              queries: [query.trim(), ...rescueQueries],
+              fetchLimit: rescueFetch,
+              searchType: search_type,
+              searchMode: search_mode,
+              includeReplies: include_replies,
+              since,
+              until,
+            });
+            const relevantRescue = keepRescueRelevant(rescue, query);
+            attempts.push({
+              actor: APIFY_FALLBACK_ACTOR,
+              status: "ok",
+              stage: "zero_result_rescue",
+              query_variants: [query.trim(), ...rescueQueries],
+              requested_candidates: rescueFetch,
+              raw_results: rescue.length,
+              relevant_results: relevantRescue.length,
+            });
+            combined.push(...relevantRescue);
+          } catch (err) {
+            const exhausted = isApifyBudgetExhausted(err);
+            if (exhausted) apifyBudgetExhausted = true;
+            attempts.push({
+              actor: APIFY_FALLBACK_ACTOR,
+              status: "error",
+              stage: "zero_result_rescue",
+              error: err?.message || String(err),
+              ...(exhausted ? { budget_exhausted: true } : {}),
+            });
+          }
+        }
+      }
+
       // When Apify itself reports HTTP 402 / exhausted monthly usage, switch
       // immediately to the reserve token source. Do not spend reserve credits
       // merely because an Actor has a temporary outage or returns few results.
@@ -1013,9 +1133,12 @@ function createServer() {
                 sort_by,
                 returned: posts.length,
                 attempts,
+                coverage_status: posts.length === 0 ? "NO_RESULTS_FROM_PUBLIC_SEARCH_SOURCES" : "PARTIAL_PUBLIC_SEARCH",
+                coverage_warning:
+                  "PENTING: 0 hasil dari scraper publik TIDAK berarti tidak ada postingan di Threads. Pencarian manual saat login dapat menampilkan hasil yang tidak diekspos ke pengunjung logged-out. Jangan menyimpulkan topik tidak ada hanya dari returned=0.",
                 note: usedLimitedToken
                   ? "Primary search sudah mencapai batas penggunaan. Limited Token Creator dipakai otomatis untuk request ini. Sumber cadangan ini maksimal sekitar 10 hasil per keyword dalam satu request."
-                  : "Search publik dapat tidak lengkap karena Threads membatasi hasil yang terlihat untuk pengunjung logged-out.",
+                  : "MCP sudah mencoba pencarian publik dan zero-result rescue. Hasil tetap bisa tidak lengkap dibanding pencarian manual di aplikasi Threads saat login.",
                 ...(usedLimitedToken && limitedCreditsRemaining !== null
                   ? { limited_token_credits_remaining: limitedCreditsRemaining }
                   : {}),
